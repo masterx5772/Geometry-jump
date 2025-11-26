@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Mini Geometry Dash - Demo</title>
+<style>
+  :root{
+    --bg:#0b1020;
+    --fg:#e6eef8;
+    --accent:#ff6b6b;
+    --muted:#9fb2c8;
+  }
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Arial;background:var(--bg);color:var(--fg)}
+  #game-wrap{display:flex;flex-direction:column;align-items:center;padding:12px;gap:12px}
+  canvas{background:linear-gradient(180deg,#071024 0%, #092036 60%);border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,.6)}
+  .ui{width:800px;max-width:95%;display:flex;justify-content:space-between;align-items:center}
+  .btn{background:transparent;border:1px solid rgba(255,255,255,.08);padding:8px 12px;border-radius:8px;color:var(--muted);cursor:pointer}
+  .btn:hover{border-color:rgba(255,255,255,.14);color:var(--fg)}
+  .panel{display:flex;gap:8px;align-items:center}
+  .big{font-size:18px;font-weight:600;color:var(--fg)}
+  #overlay{position:absolute;left:0;right:0;top:0;bottom:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
+  .centerCard{pointer-events:auto;background:rgba(3,7,15,.7);padding:20px;border-radius:12px;border:1px solid rgba(255,255,255,.04);text-align:center;min-width:260px}
+  .muted{color:var(--muted);font-size:13px}
+  .small{font-size:13px}
+  footer{color:var(--muted);font-size:12px;margin-top:6px}
+</style>
+</head>
+<body>
+<div id="game-wrap">
+  <div class="ui">
+    <div class="panel">
+      <div class="big">Mini Geometry Dash</div>
+      <div class="muted small" style="margin-left:12px">Space / Click / Touch zum Springen</div>
+    </div>
+    <div class="panel">
+      <div class="muted small">Score: <span id="score">0</span></div>
+      <button id="restartBtn" class="btn">Neu starten</button>
+    </div>
+  </div>
+
+  <canvas id="c" width="800" height="360"></canvas>
+  <footer>Tippe/Drücke Space zum Starten. Highscore wird lokal gespeichert.</footer>
+</div>
+
+<div id="overlay"></div>
+
+<script>
+/*
+  Mini Geometry Dash - Single File
+  - Player auto-run (horizontal fixed pos), jump + gravity
+  - Procedural obstacles, simple collision
+  - Score, highscore (localStorage)
+  - Touch and keyboard support
+  - Single canvas, modular-ish code
+*/
+
+// ---- Config ----
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+let W = canvas.width, H = canvas.height;
+
+const config = {
+  gravity: 0.9,
+  jumpPower: -14,
+  maxJumpHold: 12, // frames for hold-boost
+  baseSpeed: 5,
+  baseSpeedIncrease: 0.0006, // speed increases with time
+  obstacleGapMin: 160,
+  obstacleGapMax: 350,
+  obstacleWidthMin: 20,
+  obstacleWidthMax: 42,
+  obstacleHeightMax: 120,
+  spawnBuffer: 60 // when to spawn relative to right edge
+};
+
+// ---- State ----
+let running = false;
+let gameOver = false;
+let score = 0;
+let highscore = Number(localStorage.getItem('miniGD.high')||0);
+let speed = config.baseSpeed;
+let frame = 0;
+
+// Player
+const player = {
+  x: 120,
+  y: H - 60,
+  w: 28,
+  h: 28,
+  vy: 0,
+  onGround: true,
+  jumpHold: 0
+};
+
+// Obstacles
+let obstacles = [];
+let lastObstacleX = W + 200;
+
+// UI
+const scoreEl = document.getElementById('score');
+const restartBtn = document.getElementById('restartBtn');
+const overlay = document.getElementById('overlay');
+
+restartBtn.addEventListener('click', startGame);
+
+// Input
+let input = { hold:false, pressed:false };
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { inputDown(); e.preventDefault(); }
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space') inputUp();
+});
+canvas.addEventListener('pointerdown', inputDown);
+canvas.addEventListener('pointerup', inputUp);
+canvas.addEventListener('touchstart', e=>{ e.preventDefault(); inputDown(); }, {passive:false});
+canvas.addEventListener('touchend', e=>{ e.preventDefault(); inputUp(); }, {passive:false});
+
+function inputDown(){
+  input.hold = true;
+  input.pressed = true;
+  if (!running && !gameOver) startGame();
+  if (gameOver) restart();
+}
+function inputUp(){
+  input.hold = false;
+  input.pressed = false;
+  player.jumpHold = 0;
+}
+
+// ---- Helper functions ----
+function rnd(a,b){ return Math.random()*(b-a)+a; }
+function rectsIntersect(a,b){
+  return !(a.x+a.w < b.x || a.x > b.x+b.w || a.y+a.h < b.y || a.y > b.y+b.h);
+}
+
+// ---- Game logic ----
+function reset(){
+  running = false;
+  gameOver = false;
+  score = 0;
+  speed = config.baseSpeed;
+  frame = 0;
+  obstacles = [];
+  lastObstacleX = W + 200;
+  player.y = H - 60;
+  player.vy = 0;
+  player.onGround = true;
+  player.jumpHold = 0;
+  updateScoreUI();
+  showOverlay("Tippe / Drücke Space zum Starten");
+}
+
+function startGame(){
+  if (running) return;
+  hideOverlay();
+  running = true;
+  gameOver = false;
+  input.pressed = false;
+}
+
+function restart(){
+  reset();
+  startGame();
+}
+
+// Spawn obstacles procedurally
+function generateObstacle(){
+  // decide width and height
+  const w = Math.floor(rnd(config.obstacleWidthMin, config.obstacleWidthMax));
+  const h = Math.floor(rnd(28, config.obstacleHeightMax));
+  // gap until this obstacle
+  const gap = Math.floor(rnd(config.obstacleGapMin, config.obstacleGapMax));
+  const x = lastObstacleX + gap;
+  const y = H - h - 28; // 28 is ground thickness
+  obstacles.push({x, y, w, h, passed:false});
+  lastObstacleX = x + w;
+}
+
+// Update player physics
+function updatePlayer(){
+  // Jump start
+  if (input.pressed && player.onGround){
+    player.vy = config.jumpPower;
+    player.onGround = false;
+    player.jumpHold = 1;
+    input.pressed = false; // consume single-press for starting jump
+  }
+  // Jump hold (boost)
+  if (input.hold && !player.onGround && player.jumpHold > 0 && player.jumpHold < config.maxJumpHold){
+    player.vy += -0.6; // small extra upward impulse per frame while holding
+    player.jumpHold++;
+  }
+  // Gravity
+  player.vy += config.gravity;
+  player.y += player.vy;
+
+  // Ground collision
+  const groundY = H - 28 - player.h; // ground = 28 px height
+  if (player.y >= groundY){
+    player.y = groundY;
+    player.vy = 0;
+    player.onGround = true;
+    player.jumpHold = 0;
+  }
+}
+
+// Update obstacles & collisions
+function updateObstacles(){
+  // Move obstacles left by speed
+  for (let ob of obstacles) ob.x -= speed;
+
+  // Remove off-screen
+  obstacles = obstacles.filter(ob => ob.x + ob.w > -50);
+
+  // Maybe spawn
+  if (lastObstacleX < W + config.spawnBuffer) generateObstacle();
+
+  // Collision check
+  for (let ob of obstacles){
+    const rectA = { x: player.x, y: player.y, w: player.w, h: player.h };
+    const rectB = { x: ob.x, y: ob.y, w: ob.w, h: ob.h };
+    if (rectsIntersect(rectA, rectB)) {
+      // hit
+      endGame();
+    }
+    // scoring by passing obstacles
+    if (!ob.passed && (ob.x + ob.w) < player.x){
+      ob.passed = true;
+      score += 10;
+      updateScoreUI();
+    }
+  }
+}
+
+// End game
+function endGame(){
+  if (gameOver) return;
+  gameOver = true;
+  running = false;
+  // check highscore
+  if (score > highscore){
+    highscore = score;
+    localStorage.setItem('miniGD.high', String(highscore));
+  }
+  showOverlay(`Du bist gestorben!<br><b>Score: ${score}</b><br>Best: ${highscore}<br><br>Klick oder Space zum Neustart`);
+}
+
+// Draw everything
+function draw(){
+  // clear
+  ctx.fillStyle = '#071024';
+  ctx.fillRect(0,0,W,H);
+
+  // Parallax background: simple stars + mountains
+  drawBackground();
+
+  // draw ground
+  ctx.fillStyle = '#0e2236';
+  ctx.fillRect(0, H-28, W, 28);
+
+  // draw obstacles
+  for (let ob of obstacles){
+    // shadow
+    ctx.fillStyle = '#06121b';
+    ctx.fillRect(Math.floor(ob.x)+3, ob.y+4, ob.w, ob.h);
+    // main
+    ctx.fillStyle = '#ff6b6b';
+    ctx.fillRect(Math.floor(ob.x), ob.y, ob.w, ob.h);
+  }
+
+  // draw player as a rotated diamond (like a square rotated)
+  ctx.save();
+  const cx = player.x + player.w/2;
+  const cy = player.y + player.h/2;
+  ctx.translate(cx, cy);
+  // simple tilt based on vy
+  const tilt = Math.max(-0.6, Math.min(0.8, player.vy * 0.03));
+  ctx.rotate(tilt);
+  ctx.fillStyle = '#e6eef8';
+  ctx.fillRect(-player.w/2, -player.h/2, player.w, player.h);
+  ctx.restore();
+
+  // HUD: score (drawn by DOM too, but show big)
+  ctx.fillStyle = 'rgba(255,255,255,0.06)';
+  ctx.fillRect(W-220, 12, 200, 36);
+  ctx.fillStyle = '#fff';
+  ctx.font = '18px system-ui, Arial';
+  ctx.fillText(`Score: ${score}`, W-200, 36);
+}
+
+// Simple background
+let starSeed = [];
+for (let i=0;i<80;i++) starSeed.push({x:Math.random()*W,y:Math.random()*H*0.5, s: Math.random()*1.4+0.4});
+function drawBackground(){
+  // move stars slowly
+  for (let s of starSeed){
+    s.x -= speed * 0.2;
+    if (s.x < -10) s.x = W + Math.random()*50;
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    ctx.beginPath();
+    ctx.arc(s.x, s.y + 20*Math.sin((frame+s.x)*0.01), s.s, 0, Math.PI*2);
+    ctx.fill();
+  }
+  // distant mountains
+  ctx.fillStyle = '#071f2d';
+  ctx.beginPath();
+  ctx.moveTo(0,H-80);
+  ctx.lineTo(140,H-160);
+  ctx.lineTo(310,H-90);
+  ctx.lineTo(460,H-150);
+  ctx.lineTo(620,H-80);
+  ctx.lineTo(W,H-140);
+  ctx.lineTo(W,H);
+  ctx.lineTo(0,H);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// Score UI
+function updateScoreUI(){ scoreEl.textContent = String(score); }
+
+// Main loop
+function step(){
+  frame++;
+  if (running && !gameOver){
+    // increase speed slowly
+    speed += config.baseSpeedIncrease;
+    // advance score by time
+    score += Math.floor(speed * 0.02); // small passive score increment
+    updateScoreUI();
+
+    updatePlayer();
+    updateObstacles();
+  }
+  draw();
+  requestAnimationFrame(step);
+}
+
+// Overlay helpers
+function showOverlay(html){
+  overlay.innerHTML = `<div class="centerCard"><div style="font-weight:700;margin-bottom:8px">Mini Geometry Dash</div><div class="muted small">${html}</div></div>`;
+  overlay.style.pointerEvents = 'auto';
+}
+function hideOverlay(){ overlay.innerHTML=''; overlay.style.pointerEvents='none'; }
+
+// Resize canvas for crispness (keeps logical size)
+function resize(){
+  // keep fixed ratio; max width 800
+  const maxW = Math.min(window.innerWidth*0.95, 800);
+  const ratio = canvas.width / canvas.height;
+  const newW = Math.floor(maxW);
+  const newH = Math.floor(newW / ratio);
+  canvas.style.width = newW + 'px';
+  canvas.style.height = newH + 'px';
+}
+window.addEventListener('resize', resize);
+
+// Init
+reset();
+resize();
+requestAnimationFrame(step);
+
+</script>
+</body>
+</html>
